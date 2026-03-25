@@ -1,0 +1,18 @@
+class XENOLOG(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sigma = SigmaField()
+        self.memory = SigmaField()
+        self.bubble_net = BubbleField()
+
+    def forward(self, x):
+        sigma = self.sigma(x)
+        memory = self.memory(x)
+
+        bubbles = self.bubble_net(x)
+
+        sigma = sigma + memory
+
+        inter = interference(sigma, bubbles)
+
+        return inter, sigma, bubbles
