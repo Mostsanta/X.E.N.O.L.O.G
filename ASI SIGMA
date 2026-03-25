@@ -1,0 +1,119 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# =========================
+# Sigma Layer for LLM
+# =========================
+class SigmaLayer(nn.Module):
+    def __init__(self, dim, hidden=128):
+        super().__init__()
+        self.to_complex = nn.Linear(dim, dim * 2)  # real + imag
+        self.field_net = nn.Sequential(
+            nn.Linear(dim * 2, hidden), nn.Tanh(),
+            nn.Linear(hidden, dim * 2)
+        )
+        self.out_proj = nn.Linear(dim * 2, dim)
+
+    def forward(self, x):
+        # x: [batch, seq, dim]
+        B, T, D = x.shape
+
+        # Convert to complex representation
+        c = self.to_complex(x)  # [B, T, 2D]
+        real, imag = c.chunk(2, dim=-1)
+        z = torch.complex(real, imag)
+
+        # Interference across sequence (like attention but wave-based)
+        z_sum = z.mean(dim=1, keepdim=True)  # global field
+        z = z + z_sum
+
+        # Nonlinear field evolution
+        z_real = torch.view_as_real(z)  # [B, T, D, 2]
+        z_real = z_real.view(B, T, -1)
+
+        z_evolved = self.field_net(z_real)
+
+        # Back to complex
+        r, i = z_evolved.chunk(2, dim=-1)
+        z_new = torch.complex(r, i)
+
+        # Interference intensity
+        intensity = torch.abs(z_new) ** 2
+
+        out = self.out_proj(torch.cat([z_new.real, z_new.imag], dim=-1))
+
+        return out + x  # residual
+
+# =========================
+# Transformer Block with Sigma
+# =========================
+class SigmaTransformerBlock(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.sigma = SigmaLayer(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        # Attention
+        attn_out, _ = self.attn(x, x, x)
+        x = x + attn_out
+        x = self.norm1(x)
+
+        # Sigma Field Layer
+        x = self.sigma(x)
+        x = self.norm2(x)
+
+        # Feedforward
+        x = x + self.ff(x)
+        x = self.norm3(x)
+
+        return x
+
+# =========================
+# Minimal LLM with Sigma Layers
+# =========================
+class SigmaLLM(nn.Module):
+    def __init__(self, vocab_size, dim=128, depth=4):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.ModuleList([
+            SigmaTransformerBlock(dim) for _ in range(depth)
+        ])
+        self.lm_head = nn.Linear(dim, vocab_size)
+
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        logits = self.lm_head(x)
+        return logits
+
+# =========================
+# Example Usage
+# =========================
+if __name__ == "__main__":
+    vocab_size = 1000
+    model = SigmaLLM(vocab_size)
+
+    input_ids = torch.randint(0, vocab_size, (2, 16))
+    logits = model(input_ids)
+
+    print("Logits shape:", logits.shape)
+
+    # Training step example
+    targets = torch.randint(0, vocab_size, (2, 16))
+    loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+
+    loss.backward()
+    print("Loss:", loss.item())
