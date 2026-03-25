@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+# =========================
+# Positional grid
+# =========================
+def build_coords(B, T, device):
+    t = torch.linspace(0, 1, T, device=device)
+    t = t.unsqueeze(0).repeat(B, 1)
+    x = torch.linspace(0, 1, T, device=device)
+    x = x.unsqueeze(0).repeat(B, 1)
+    coords = torch.stack([x, t], dim=-1)
+    return coords
+
+# =========================
+# Memory Field
+# =========================
+class MemoryField(nn.Module):
+    def __init__(self, dim, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden), nn.Tanh(),
+            nn.Linear(hidden, dim * 2)
+        )
+
+    def forward(self, coords):
+        out = self.net(coords)
+        r, i = out.chunk(2, dim=-1)
+        return torch.complex(r, i)
+
+# =========================
+# Kuramoto Sync
+# =========================
+def kuramoto_sync(z, K=0.5):
+    phase = torch.angle(z)
+    mean_phase = torch.mean(torch.exp(1j * phase), dim=1, keepdim=True)
+    sync_force = K * torch.imag(mean_phase * torch.exp(-1j * phase))
+    new_phase = phase + sync_force
+    amplitude = torch.abs(z)
+    return amplitude * torch.exp(1j * new_phase)
+
+# =========================
+# Multi-scale Sigma Layer
+# =========================
+class MultiScaleSigma(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.low = SigmaReverbLayer(dim)
+        self.mid = SigmaReverbLayer(dim)
+        self.high = SigmaReverbLayer(dim)
+
+    def forward(self, x):
+        x_low = self.low(x)
+        x_mid = self.mid(x_low)
+        x_high = self.high(x_mid)
+        return x_low + x_mid + x_high
+
+# =========================
+# Sigma-Reverb Layer
+# =========================
+class SigmaReverbLayer(nn.Module):
+    def __init__(self, dim, hidden=128):
+        super().__init__()
+        self.to_complex = nn.Linear(dim, dim * 2)
+        self.field_net = nn.Sequential(
+            nn.Linear(dim * 2, hidden), nn.Tanh(),
+            nn.Linear(hidden, dim * 2)
+        )
+        self.memory_field = MemoryField(dim)
+        self.K = nn.Parameter(torch.tensor(0.5))
+        self.out_proj = nn.Linear(dim * 2, dim)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        coords = build_coords(B, T, x.device)
+
+        c = self.to_complex(x)
+        r, i = c.chunk(2, dim=-1)
+        z = torch.complex(r, i)
+
+        R = self.memory_field(coords)
+        z = z + R + R**2
+
+        z = kuramoto_sync(z, self.K)
+
+        z_real = torch.view_as_real(z).view(B, T, -1)
+        z_evolved = self.field_net(z_real)
+
+        r2, i2 = z_evolved.chunk(2, dim=-1)
+        z_new = torch.complex(r2, i2)
+
+        self.last_phase = torch.angle(z_new).detach()
+
+        out = self.out_proj(torch.cat([z_new.real, z_new.imag], dim=-1))
+        return out + x
+
+# =========================
+# Model
+# =========================
+class SigmaLLM(nn.Module):
+    def __init__(self, vocab_size, dim=128, depth=4):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.ModuleList([MultiScaleSigma(dim) for _ in range(depth)])
+        self.head = nn.Linear(dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        return self.head(x)
+
+# =========================
+# Synthetic reasoning dataset
+# =========================
+def generate_reasoning_batch(batch=32, seq=10, vocab=50):
+    x = torch.randint(0, vocab//2, (batch, seq))
+    y = (x.sum(dim=1) % vocab).unsqueeze(1).repeat(1, seq)
+    return x, y
+
+# =========================
+# Metrics
+# =========================
+def phase_coherence(phases):
+    return torch.abs(torch.mean(torch.exp(1j * phases)))
+
+# =========================
+# Visualization
+# =========================
+def visualize_phases(phases):
+    plt.imshow(phases.cpu(), aspect='auto')
+    plt.colorbar()
+    plt.title("Phase Synchronization")
+    plt.show()
+
+# =========================
+# Training
+# =========================
+def train():
+    model = SigmaLLM(vocab_size=50)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    for step in range(200):
+        x, y = generate_reasoning_batch()
+        logits = model(x)
+
+        loss = F.cross_entropy(logits.view(-1, 50), y.view(-1))
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if step % 20 == 0:
+            layer = model.layers[0].low
+            coherence = phase_coherence(layer.last_phase)
+            print(f"Step {step} Loss {loss.item():.4f} Coherence {coherence:.4f}")
+            visualize_phases(layer.last_phase[0])
+
+if __name__ == "__main__":
+    train()
